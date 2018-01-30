@@ -5,6 +5,8 @@ import com.rackspacecloud.blueflood.elasticsearchconsumer.model.*;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
@@ -20,6 +22,17 @@ import java.util.concurrent.CountDownLatch;
 
 @Component
 public class Listener {
+    @Autowired
+    RestTemplate restTemplate;
+
+    @Value("${elasticsearch.index.bulk.url}")
+    private String elasticsearchIndexBulkUrl;
+
+    @Value("${elasticsearch.index.name}")
+    private String elasticsearchIndexName;
+
+    @Value("${elasticsearch.type}")
+    private String elasticsearchType;
 
     private static final Logger LOGGER =
             LoggerFactory.getLogger(Listener.class);
@@ -41,8 +54,8 @@ public class Listener {
         String metricName = input.getMetricString();
 
         Index index = new Index();
-        index.setIndex("metric_metadata");
-        index.setType("metrics");
+        index.setIndex(elasticsearchIndexName);
+        index.setType(elasticsearchType);
         index.setId(String.format("%s:%s", tenantId, metricName));
         index.setRouting(tenantId);
 
@@ -59,17 +72,15 @@ public class Listener {
 
         String payload = bulkPayload.toString();
 
-        String url = "http://127.0.0.1:9200/_bulk";
-
-        RestTemplate restTemplate = new RestTemplate();
         HttpEntity<String> request = new HttpEntity<>(payload);
 
-        ResponseEntity<BulkPayload> response = restTemplate.exchange(url, HttpMethod.POST, request, BulkPayload.class);
+        ResponseEntity<BulkPayload> response =
+                restTemplate.exchange(elasticsearchIndexBulkUrl, HttpMethod.POST, request, BulkPayload.class);
         if(response.getStatusCode() != HttpStatus.OK){
             LOGGER.error("Couldn't index the payload -> {}", payload);
         }
         else{
-            System.out.println("Successfully indexed payload in ES -> " + strRecord);
+            LOGGER.info("Successfully indexed payload in ES -> " + strRecord);
         }
     }
 }
