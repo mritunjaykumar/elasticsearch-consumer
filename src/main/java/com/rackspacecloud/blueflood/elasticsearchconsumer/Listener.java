@@ -1,5 +1,6 @@
 package com.rackspacecloud.blueflood.elasticsearchconsumer;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.rackspacecloud.blueflood.elasticsearchconsumer.model.*;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -12,12 +13,12 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.kafka.annotation.KafkaListener;
-import org.springframework.kafka.annotation.PartitionOffset;
-import org.springframework.kafka.annotation.TopicPartition;
 import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
 import org.springframework.web.client.RestTemplate;
 
 import java.io.IOException;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 
 @Component
@@ -25,8 +26,8 @@ public class Listener {
     @Autowired
     RestTemplate restTemplate;
 
-    @Value("${elasticsearch.index.bulk.url}")
-    private String elasticsearchIndexBulkUrl;
+    @Value("${elasticsearch.url}")
+    private String elasticsearchIndexUrl;
 
     @Value("${elasticsearch.index.name}")
     private String elasticsearchIndexName;
@@ -34,25 +35,56 @@ public class Listener {
     @Value("${elasticsearch.type}")
     private String elasticsearchType;
 
-    private static final Logger LOGGER =
-            LoggerFactory.getLogger(Listener.class);
+    private static final Logger LOGGER = LoggerFactory.getLogger(Listener.class);
 
     private CountDownLatch latch = new CountDownLatch(1);
 
-    @KafkaListener(id = "blueflood-metrics-listener", topicPartitions =
-            { @TopicPartition(topic = "blueflood-metrics",
-                    partitionOffsets = @PartitionOffset(partition = "0", initialOffset = "0"))
-            })
-    public void listenBluefloodMetrics(ConsumerRecord<?, ?> record) throws IOException {
-        LOGGER.info("Received payload='{}'", record);
+    @KafkaListener(topics = "#{'${kafka.topics.in}'.split(',')}")
+    public void listenBluefloodMetrics(ConsumerRecord<?, ?> record) {
+        //TODO: Get tracking ID from the record to stitch the tracing
+        String passedTrackingId = "";
+        String currentTrackingId = "";
+
+        currentTrackingId = StringUtils.isEmpty(passedTrackingId)
+                ? UUID.randomUUID().toString() : String.format("%s|%s", passedTrackingId, currentTrackingId);
+
+        LOGGER.info("TrackingId:{}, START: Processing", currentTrackingId);
+        LOGGER.debug("TrackingId:{}, Received payload:{}", currentTrackingId, record);
         String strRecord = record.value().toString();
 
         ObjectMapper objectMapper = new ObjectMapper();
-        Input input = objectMapper.readValue(strRecord, Input.class);
+        Input input = null;
+        try {
+            input = objectMapper.readValue(strRecord, Input.class);
+        } catch (IOException e) {
+            LOGGER.error("TrackingId:{}, Exception message: {}, Stack trace: {}",
+                    currentTrackingId, e.getMessage(), e.getStackTrace());
+        }
 
         String tenantId = input.getTenantId();
         String metricName = input.getMetricString();
 
+        IndexingMetadata indexingMetadata = getIndexingMetadata(tenantId, metricName);
+
+        MetricInformation metricInformation = new MetricInformation();
+        metricInformation.setTenantId(tenantId);
+        metricInformation.setMetricName(metricName);
+
+        BulkPayload bulkPayload = new BulkPayload();
+
+        try {
+            bulkPayload.setIndexingMetadata(objectMapper.writeValueAsString(indexingMetadata));
+            bulkPayload.setMetricInformation(objectMapper.writeValueAsString(metricInformation));
+        } catch (JsonProcessingException e) {
+            LOGGER.error("TrackingId:{}, Exception message: {}, Stack trace: {}",
+                    currentTrackingId, e.getMessage(), e.getStackTrace());
+        }
+
+        indexIntoElasticsearch(currentTrackingId, strRecord, bulkPayload);
+        LOGGER.info("TrackingId:{}, FINISH: Processing", currentTrackingId);
+    }
+
+    private IndexingMetadata getIndexingMetadata(String tenantId, String metricName) {
         Index index = new Index();
         index.setIndex(elasticsearchIndexName);
         index.setType(elasticsearchType);
@@ -61,26 +93,30 @@ public class Listener {
 
         IndexingMetadata indexingMetadata = new IndexingMetadata();
         indexingMetadata.setIndex(index);
+        return indexingMetadata;
+    }
 
-        MetricInformation metricInformation = new MetricInformation();
-        metricInformation.setTenantId(tenantId);
-        metricInformation.setMetricName(metricName);
-
-        BulkPayload bulkPayload = new BulkPayload();
-        bulkPayload.setIndexingMetadata(objectMapper.writeValueAsString(indexingMetadata));
-        bulkPayload.setMetricInformation(objectMapper.writeValueAsString(metricInformation));
-
+    private void indexIntoElasticsearch(String currentTrackingId, String strRecord, BulkPayload bulkPayload) {
         String payload = bulkPayload.toString();
 
         HttpEntity<String> request = new HttpEntity<>(payload);
+        String url = String.format("%s/_bulk", elasticsearchIndexUrl);
+        ResponseEntity<BulkPayload> response = null;
+        try {
+            response = restTemplate.exchange(url, HttpMethod.POST, request, BulkPayload.class);
+        }
+        catch(Exception ex){
+            LOGGER.error("TrackingId:{}, Using url [{}], Exception message: {}",
+                    currentTrackingId, url, ex.getMessage());
+        }
 
-        ResponseEntity<BulkPayload> response =
-                restTemplate.exchange(elasticsearchIndexBulkUrl, HttpMethod.POST, request, BulkPayload.class);
         if(response.getStatusCode() != HttpStatus.OK){
-            LOGGER.error("Couldn't index the payload -> {}", payload);
+            LOGGER.error("TrackingId:{}, Using elasticsearch url [{}], couldn't index the payload -> {}",
+                    currentTrackingId, url, payload);
         }
         else{
-            LOGGER.info("Successfully indexed payload in ES -> " + strRecord);
+            LOGGER.info("TrackingId:{}, Successfully indexed payload in elasticsearch -> {}",
+                    currentTrackingId, strRecord);
         }
     }
 }
